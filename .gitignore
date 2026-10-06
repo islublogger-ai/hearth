@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.tools/
+.agent-work/
+src-tauri/target/
+test-results/
+playwright-report/
+.DS_Store
+*.log
