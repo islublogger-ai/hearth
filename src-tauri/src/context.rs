@@ -21,10 +21,12 @@ pub fn strip_thinking(text: &str) -> String {
         let Some((_, answer)) = tail.split_once("<|message|>") else {
             return String::new();
         };
-        answer
-            .split(["<|end|>", "<|return|>", "<|im_end|>"])
-            .next()
-            .unwrap_or_default()
+        let end = ["<|end|>", "<|return|>", "<|im_end|>"]
+            .iter()
+            .filter_map(|marker| answer.find(marker))
+            .min()
+            .unwrap_or(answer.len());
+        &answer[..end]
     } else if let Some(index) = lower.find("<|final|>") {
         &text[index + "<|final|>".len()..]
     } else if lower.contains("<|channel|>analysis") || lower.contains("<|analysis|>") {
@@ -280,7 +282,10 @@ mod tests {
 
     #[test]
     fn strips_nested_unclosed_unicode_and_harmony_thinking() {
-        assert_eq!(strip_thinking("<think>秘密<think>more</think></think>Visible 猫"), "Visible 猫");
+        assert_eq!(
+            strip_thinking("<think>秘密<think>more</think></think>Visible 猫"),
+            "Visible 猫"
+        );
         assert_eq!(strip_thinking("Answer<think>never closes"), "Answer");
         assert_eq!(strip_thinking("<THINK>hidden</THINK>Okay"), "Okay");
         assert_eq!(strip_thinking("<|start|>assistant<|channel|>analysis<|message|>secret<|end|><|start|>assistant<|channel|>final<|message|>Done.<|return|>"), "Done.");
@@ -300,7 +305,11 @@ mod tests {
             message("user", &"old".repeat(100), "complete"),
             message("assistant", "old answer", "complete"),
             message("user", "recent question", "complete"),
-            message("assistant", "<think>secret</think>recent answer", "complete"),
+            message(
+                "assistant",
+                "<think>secret</think>recent answer",
+                "complete",
+            ),
             message("user", "newest question", "complete"),
             message("assistant", "placeholder partial", "streaming"),
         ]);
@@ -322,7 +331,10 @@ mod tests {
         };
         let chat = conversation(vec![message("user", &"猫".repeat(200), "complete")]);
         assert!(build(&chat, &settings, &[], false).is_err());
-        let invalid = Settings { max_output_tokens: 100, ..settings };
+        let invalid = Settings {
+            max_output_tokens: 100,
+            ..settings
+        };
         assert!(build(&chat, &invalid, &[], false).is_err());
     }
 

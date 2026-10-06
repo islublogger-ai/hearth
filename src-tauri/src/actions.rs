@@ -44,8 +44,8 @@ pub fn parse(text: &str) -> Result<Action, String> {
     let repaired = remove_trailing_commas(text);
     // serde_json::Value normally accepts duplicate keys. A strict visitor avoids
     // approving one interpretation of an ambiguous action.
-    let StrictValue(value) = serde_json::from_str(&repaired)
-        .map_err(|err| format!("Invalid action JSON: {err}"))?;
+    let StrictValue(value) =
+        serde_json::from_str(&repaired).map_err(|err| format!("Invalid action JSON: {err}"))?;
     let object = value.as_object().ok_or("Action must be a JSON object")?;
     if object.len() == 1 && object.contains_key("final") {
         let answer = object["final"]
@@ -54,20 +54,20 @@ pub fn parse(text: &str) -> Result<Action, String> {
             .ok_or("'final' must be a nonempty string")?;
         return Ok(Action::Final(answer.to_owned()));
     }
-    let (name_key, args_key) = if object.len() == 2
-        && object.contains_key("tool")
-        && object.contains_key("args")
-    {
-        ("tool", "args")
-    } else if hermes
-        && object.len() == 2
-        && object.contains_key("name")
-        && object.contains_key("arguments")
-    {
-        ("name", "arguments")
-    } else {
-        return Err("Use exactly {\"final\":\"answer\"} or {\"tool\":\"name\",\"args\":{...}}".into());
-    };
+    let (name_key, args_key) =
+        if object.len() == 2 && object.contains_key("tool") && object.contains_key("args") {
+            ("tool", "args")
+        } else if hermes
+            && object.len() == 2
+            && object.contains_key("name")
+            && object.contains_key("arguments")
+        {
+            ("name", "arguments")
+        } else {
+            return Err(
+                "Use exactly {\"final\":\"answer\"} or {\"tool\":\"name\",\"args\":{...}}".into(),
+            );
+        };
     let name = object[name_key]
         .as_str()
         .filter(|name| {
@@ -108,9 +108,7 @@ fn remove_trailing_commas(text: &str) -> String {
             quoted = true;
         }
         if byte == b',' {
-            let next = bytes[index + 1..]
-                .iter()
-                .find(|b| !b.is_ascii_whitespace());
+            let next = bytes[index + 1..].iter().find(|b| !b.is_ascii_whitespace());
             if matches!(next, Some(b'}' | b']')) {
                 continue;
             }
@@ -222,6 +220,9 @@ mod tests {
         ] {
             assert!(parse(text).is_err(), "accepted {text}");
         }
-        assert_eq!(parse("{\"final\":\"Done.\"}"), Ok(Action::Final("Done.".into())));
+        assert_eq!(
+            parse("{\"final\":\"Done.\"}"),
+            Ok(Action::Final("Done.".into()))
+        );
     }
 }

@@ -10,6 +10,9 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
     "test:e2e": "playwright test",
+    "test:core": "node scripts/rust.mjs test",
+    "lint:core": "node scripts/rust.mjs clippy --all-targets -- -D warnings",
+    "fmt:core": "node scripts/rust.mjs fmt",
     "tauri": "node scripts/tauri.mjs",
     "desktop": "node scripts/tauri.mjs dev",
     "package": "node scripts/tauri.mjs build --bundles app",
@@ -17,8 +20,6 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",
-    "katex": "^0.19.0",
-    "lucide-svelte": "^0.468.0",
     "markdown-it": "^14.1.0",
     "svelte": "^5.57.1"
   },

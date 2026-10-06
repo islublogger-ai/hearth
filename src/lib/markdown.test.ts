@@ -13,4 +13,8 @@ describe('model-output rendering', () => {
     const result = renderMarkdown('[docs](https://example.com)');
     expect(result).toContain('noopener noreferrer'); expect(result).toContain('target="_blank"');
   });
+  it('does not fetch model-supplied remote images', () => {
+    const result = renderMarkdown('![private request](https://example.com/tracker.png)');
+    expect(result).not.toContain('<img'); expect(result).not.toContain('src='); expect(result).toContain('private request');
+  });
 });

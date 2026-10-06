@@ -35,7 +35,7 @@ External web search/fetch, shell/Python/MCP, semantic vector retrieval and unatt
 
 ## Discussion resolutions
 
-Grok proposed an axum shell first to avoid getting blocked by native tooling. Sol has installed a workspace-local Rust toolchain and prepared the Tauri shell; retain Tauri and verify native compilation immediately. The separate core modules stay independent of Tauri wherever practical. Grok's offline walkthrough proposal is accepted only as an explicitly selected, visibly scripted walkthrough with no claims of model inference; genuine backends remain separately identified. MiMo's cancellation, FTS, storage and permission findings are release gates. No automatic backend fallback or model load/swap will occur. Native audit records must exclude incognito and be bounded in retention. Actual hardware drives the system readout; no fixed 32 GB recommendation.
+Grok proposed an axum shell first to avoid getting blocked by native tooling. Sol has installed a workspace-local Rust toolchain and prepared the Tauri shell; retain Tauri and verify native compilation immediately. The separate core modules stay independent of Tauri wherever practical. No scripted product walkthrough is included; disconnected mode supports management only and explains that generation needs the desktop app and a configured server. MiMo's cancellation, FTS, storage and permission findings are release gates. No automatic backend fallback or model load/swap will occur. Native audit records must exclude incognito and be bounded in retention. Actual hardware drives the system readout; no fixed 32 GB recommendation.
 
 ## Verification gates
 
@@ -44,3 +44,8 @@ All three main agents must assess the final implementation. Required automated c
 ## Corrected assumptions
 
 Identical models hosted by different servers occupy separate memory. Chat and agents reuse the selected resident backend by default. Backend discovery is read-only; no warmup, capability generation probes or implicit model swaps. Inference is restricted to explicit loopback endpoints for this release. External network tools default off. Unknown RAM/model metadata is displayed as unknown and token budgets are heuristic estimates until a backend reports actual usage.
+
+
+## Final implementation clarifications
+
+Agent mode prioritizes JSON actions and requests the fastest reasoning settings (for GPT-OSS, `reasoning_effort: "low"` — low reasoning, not zero); a server may still perform internal reasoning. Plain chat retains supported family-specific Fast/Deep parameters. A stable prefix means Hearth sends stable request bytes, not that a server's chat template or cache is stable. The current release uses conservative byte-based estimates and lexical memory retrieval. Raw Harmony streaming, exact tokenization, embedding search and automatic memory extraction remain deferred.

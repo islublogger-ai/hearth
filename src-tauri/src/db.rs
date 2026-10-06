@@ -15,7 +15,8 @@
 //! * Corrupt payloads surface as errors that name the offending row. The database
 //!   is never discarded or rewritten behind the user's back.
 //! * Search covers message `content` and conversation titles only. `thinking` text
-//!   is never indexed.
+//!   is never indexed. A blank query returns every conversation id. Genuine
+//!   SQLite failures propagate; only an FTS syntax error degrades to no matches.
 
 use crate::models::{Conversation, Memory, Message, Settings, Stats, ToolStep};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -244,6 +245,12 @@ fn validate_message(message: &Message) -> Result<(), String> {
         json_field(&tool.args, "Tool arguments")?;
     }
     if let Some(stats) = &message.stats {
+        // NaN serialises as JSON null and then fails the next read. Reject it here.
+        if !stats.tokens_per_second.is_finite() || stats.tokens_per_second < 0.0 {
+            return Err(
+                "Message stats tokens_per_second must be finite and nonnegative.".into(),
+            );
+        }
         json_field(stats, "Message stats")?;
     }
     Ok(())
@@ -327,6 +334,13 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
         check_text(&backend.url, 2_000, "Backend URL")?;
     }
     Ok(())
+}
+
+/// An FTS parse failure is a no-match. A missing table, a locked database, or a
+/// bad row is a real error and must not look like an empty search.
+fn is_malformed_fts(error: &rusqlite::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("fts5:") || message.contains("syntax error")
 }
 
 /// Quote each whitespace-separated term so malformed FTS syntax is impossible
@@ -476,8 +490,17 @@ impl Store {
         let Some(json) = stored else {
             return Ok(Settings::default());
         };
-        serde_json::from_str(&json)
-            .map_err(|e| format!("Stored settings are corrupt ({e}). Save settings again to replace them."))
+        let mut settings: Settings = serde_json::from_str(&json).map_err(|e| {
+            format!("Stored settings are corrupt ({e}). Save settings again to replace them.")
+        })?;
+        // Read-time normalisation only. The stored row is left untouched so a
+        // later valid save is what repairs it.
+        settings.network_tools = false;
+        settings.auto_extract = false;
+        validate_settings(&settings).map_err(|e| {
+            format!("Stored settings are invalid ({e}). Save settings again to replace them.")
+        })?;
+        Ok(settings)
     }
 
     /// Atomic whole-conversation save: upsert metadata, replace messages in order.
@@ -553,18 +576,21 @@ impl Store {
     /// and output can contain private transcript data — deletion leaves no hidden copy.
     pub fn delete_conversation(&self, conversation_id: &str) -> Result<(), String> {
         check_id(conversation_id)?;
-        let conn = self.guard()?;
-        conn.execute(
+        let mut guard = self.guard()?;
+        let tx = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        tx.execute(
             "DELETE FROM conversations WHERE id = ?1",
             params![conversation_id],
         )
         .map_err(|e| e.to_string())?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM audit WHERE conversation_id = ?1",
             params![conversation_id],
         )
         .map_err(|e| e.to_string())?;
-        Ok(())
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn save_memory(&self, memory: &Memory) -> Result<(), String> {
@@ -618,15 +644,16 @@ impl Store {
 
     /// Conversation ids whose message content matches the query (FTS words) or
     /// whose title contains it (case-insensitive), newest activity first.
-    /// Malformed queries degrade to empty results rather than errors.
+    /// A blank query returns every id in that order. An FTS syntax error
+    /// degrades to no matches; any other SQLite or row failure propagates.
     pub fn search_conversations(&self, query: &str) -> Result<Vec<String>, String> {
         let raw: String = query.trim().chars().take(SEARCH_MAX_CHARS).collect();
         if raw.is_empty() {
-            return Ok(Vec::new());
+            return self.all_conversation_ids();
         }
         let fts = fts_query(&raw);
         if fts.is_empty() {
-            return Ok(Vec::new());
+            return self.all_conversation_ids();
         }
         let conn = self.guard()?;
         let mut stmt = conn
@@ -640,19 +667,38 @@ impl Store {
                  ) ORDER BY c.updated_at DESC, c.created_at DESC, c.id",
             )
             .map_err(|e| e.to_string())?;
-        let rows = stmt
+        let rows = match stmt
             .query_map(params![fts, like_pattern(&raw)], |row| row.get::<_, String>(0))
-            .map_err(|_| String::new());
-        let rows = match rows {
+        {
             Ok(rows) => rows,
-            // Malformed FTS syntax must degrade to empty, never to a user-visible error.
-            Err(_) => return Ok(Vec::new()),
+            Err(error) if is_malformed_fts(&error) => return Ok(Vec::new()),
+            Err(error) => return Err(error.to_string()),
         };
         let mut ids = Vec::new();
         for id in rows {
-            ids.push(id.map_err(|_| String::new()).unwrap_or_default());
+            match id {
+                Ok(id) => ids.push(id),
+                Err(error) if is_malformed_fts(&error) => return Ok(Vec::new()),
+                Err(error) => return Err(error.to_string()),
+            }
         }
-        ids.retain(|id| !id.is_empty());
+        Ok(ids)
+    }
+
+    fn all_conversation_ids(&self) -> Result<Vec<String>, String> {
+        let conn = self.guard()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id FROM conversations ORDER BY updated_at DESC, created_at DESC, id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut ids = Vec::new();
+        for id in rows {
+            ids.push(id.map_err(|e| e.to_string())?);
+        }
         Ok(ids)
     }
 
@@ -661,18 +707,21 @@ impl Store {
     pub fn record_audit(&self, conversation_id: &str, step: &ToolStep) -> Result<(), String> {
         check_id(conversation_id)?;
         let json = json_field(step, "Tool step")?;
-        let conn = self.guard()?;
-        conn.execute(
+        let mut guard = self.guard()?;
+        let tx = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        tx.execute(
             "INSERT INTO audit (conversation_id, tool_step_json, ts) VALUES (?1, ?2, ?3)",
             params![conversation_id, json, now_ms()],
         )
         .map_err(|e| e.to_string())?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY id DESC LIMIT ?1)",
             params![AUDIT_KEEP as i64],
         )
         .map_err(|e| e.to_string())?;
-        Ok(())
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Audit trail for a conversation, oldest first. Purged with the conversation.
@@ -753,6 +802,7 @@ fn migrate(conn: &mut Connection) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::models::EndpointConfig;
+    use rusqlite::params;
 
     fn message(id: &str, content: &str, status: &str) -> Message {
         Message {
@@ -898,13 +948,27 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_empty_queries_degrade_to_empty() {
+    fn blank_search_returns_every_id_and_bad_syntax_degrades() {
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(&dir);
-        let mut conversation = conversation("c1");
-        conversation.messages = vec![message("m1", "hello", "complete")];
-        store.save_conversation(&conversation).unwrap();
-        for query in ["", "   ", "\"", "\"\"\"\"", "AND OR NOT(", "^"] {
+        let mut older = conversation("c-old");
+        older.updated_at = 1_000;
+        older.messages = vec![message("m1", "hello", "complete")];
+        let mut newer = conversation("c-new");
+        newer.updated_at = 5_000;
+        newer.created_at = 1_500;
+        newer.messages = vec![message("m2", "other", "complete")];
+        store.save_conversation(&older).unwrap();
+        store.save_conversation(&newer).unwrap();
+        assert_eq!(
+            store.search_conversations("").unwrap(),
+            vec!["c-new".to_string(), "c-old".to_string()]
+        );
+        assert_eq!(
+            store.search_conversations("   ").unwrap(),
+            vec!["c-new".to_string(), "c-old".to_string()]
+        );
+        for query in ["\"", "\"\"\"\"", "AND OR NOT(", "^"] {
             assert!(
                 store.search_conversations(query).unwrap().is_empty(),
                 "query {query:?} should degrade to empty"
@@ -913,6 +977,23 @@ mod tests {
         // A 10KB paste is truncated, not an error.
         let long = "word ".repeat(2_000);
         let _ = store.search_conversations(&long).unwrap();
+    }
+
+    #[test]
+    fn search_propagates_real_sqlite_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir);
+        let mut conversation = conversation("c1");
+        conversation.messages = vec![message("m1", "hello", "complete")];
+        store.save_conversation(&conversation).unwrap();
+        store
+            .guard()
+            .unwrap()
+            .execute_batch("DROP TABLE messages_fts;")
+            .unwrap();
+        let error = store.search_conversations("hello").unwrap_err();
+        assert!(!error.is_empty(), "a missing index must not look like no matches: {error}");
+        assert_eq!(store.search_conversations("").unwrap(), vec!["c1".to_string()]);
     }
 
     #[test]
@@ -1101,5 +1182,166 @@ mod tests {
         let store = open_store(&dir);
         store.delete_conversation("ghost").unwrap();
         store.delete_memory("ghost").unwrap();
+    }
+
+    #[test]
+    fn duplicate_message_id_rolls_back_the_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir);
+        let mut base = conversation("c1");
+        base.messages = vec![message("m1", "kept", "complete")];
+        store.save_conversation(&base).unwrap();
+
+        let mut bad = base.clone();
+        bad.updated_at = 9_000;
+        bad.messages = vec![
+            message("m-dup", "first", "complete"),
+            message("m-dup", "second", "complete"),
+        ];
+        assert!(store.save_conversation(&bad).is_err());
+        let restored = store.conversations().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].updated_at, 2_000);
+        assert_eq!(restored[0].messages.len(), 1);
+        assert_eq!(restored[0].messages[0].content, "kept");
+    }
+
+    #[test]
+    fn stats_rate_must_be_finite_and_nonnegative() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir);
+        let mut conversation = conversation("c1");
+        let mut assistant = message("m1", "kept", "complete");
+        assistant.stats = Some(Stats {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            ttft_ms: 1,
+            duration_ms: 1,
+            tokens_per_second: 1.0,
+            estimated: false,
+            backend_id: "lmstudio".into(),
+            model_id: "m".into(),
+        });
+        conversation.messages = vec![assistant];
+        store.save_conversation(&conversation).unwrap();
+
+        for rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1] {
+            let mut bad = conversation.clone();
+            bad.messages[0].stats.as_mut().unwrap().tokens_per_second = rate;
+            assert!(
+                store.save_conversation(&bad).is_err(),
+                "rate {rate} should be rejected"
+            );
+        }
+        let restored = store.conversations().unwrap();
+        assert_eq!(restored[0].messages[0].content, "kept");
+        assert_eq!(
+            restored[0].messages[0].stats.as_ref().unwrap().tokens_per_second,
+            1.0
+        );
+    }
+
+    #[test]
+    fn settings_load_normalises_flags_and_keeps_invalid_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir);
+        store.save_settings(&Settings::default()).unwrap();
+        let json: String = store
+            .guard()
+            .unwrap()
+            .query_row("SELECT json FROM settings WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["networkTools"] = serde_json::json!(true);
+        value["autoExtract"] = serde_json::json!(true);
+        store
+            .guard()
+            .unwrap()
+            .execute(
+                "UPDATE settings SET json = ?1 WHERE id = 1",
+                params![value.to_string()],
+            )
+            .unwrap();
+        let loaded = store.settings().unwrap();
+        assert!(!loaded.network_tools);
+        assert!(!loaded.auto_extract);
+        let stored: String = store
+            .guard()
+            .unwrap()
+            .query_row("SELECT json FROM settings WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            stored.contains("\"networkTools\":true"),
+            "load normalises without rewriting the row: {stored}"
+        );
+
+        value["theme"] = serde_json::json!("neon");
+        store
+            .guard()
+            .unwrap()
+            .execute(
+                "UPDATE settings SET json = ?1 WHERE id = 1",
+                params![value.to_string()],
+            )
+            .unwrap();
+        let error = store.settings().unwrap_err();
+        assert!(
+            error.contains("Theme") || error.contains("invalid"),
+            "{error}"
+        );
+        let still: String = store
+            .guard()
+            .unwrap()
+            .query_row("SELECT json FROM settings WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert!(still.contains("neon"), "invalid settings stay on disk");
+        let mut conversation = conversation("c1");
+        conversation.messages = vec![message("m1", "still works", "complete")];
+        store.save_conversation(&conversation).unwrap();
+        assert_eq!(store.conversations().unwrap().len(), 1);
+    }
+
+    fn memory_ids_matching(store: &Store, term: &str) -> Vec<String> {
+        let conn = store.guard().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id FROM memories_fts \
+                 JOIN memories m ON m.seq = memories_fts.rowid \
+                 WHERE memories_fts MATCH ?1",
+            )
+            .unwrap();
+        let query = format!("\"{term}\"");
+        let rows = stmt
+            .query_map(params![query], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    #[test]
+    fn memory_fts_follows_edits_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir);
+        let memory = Memory {
+            id: "mem1".into(),
+            text: "moonflower tea".into(),
+            category: "preference".into(),
+            status: "active".into(),
+            pinned: false,
+            enabled: true,
+            created_at: 5,
+            updated_at: 6,
+        };
+        store.save_memory(&memory).unwrap();
+        assert_eq!(memory_ids_matching(&store, "moonflower"), vec!["mem1"]);
+
+        let mut edited = memory.clone();
+        edited.text = "orchid tea".into();
+        edited.updated_at = 7;
+        store.save_memory(&edited).unwrap();
+        assert!(memory_ids_matching(&store, "moonflower").is_empty());
+        assert_eq!(memory_ids_matching(&store, "orchid"), vec!["mem1"]);
+
+        store.delete_memory("mem1").unwrap();
+        assert!(memory_ids_matching(&store, "orchid").is_empty());
     }
 }
